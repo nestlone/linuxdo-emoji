@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Market Emoji Picker for Linux.do (Performance & UI Pro)
 // @namespace    https://linux.do/
-// @version      3.4.2
+// @version      0.0.1
 // @description  从云端市场加载表情包并允许用户组合分组，注入高性能精美表情选择器到 Linux.do 论坛（版本直显、GitHub一键在线更新、IndexedDB二进制离线缓存、并行高并发加载、分片渐进渲染、表情收藏、零闪烁、现代UI）
 // @author       stevessr (Optimized & Fixed)
 // @match        https://linux.do/*
@@ -9,6 +9,7 @@
 // @icon         https://cdn3.ldstatic.com/optimized/3X/9/d/9dd49731091ce8656e94433a26a3ef76f9c0f8d9_2_32x32.png
 // @updateURL    https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js
 // @downloadURL  https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js
+// @homepageURL  https://github.com/nestlone/linuxdo-emoji
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -31,9 +32,9 @@
   window[INSTANCE_FLAG] = true
 
   // ============== 常量与配置 ==============
-  const CURRENT_VERSION = '3.4.2'
+  const CURRENT_VERSION = '0.0.1'
   const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js'
-  const GITHUB_REPO_URL = 'https://github.com/shidehai/linuxdo-emoji'
+  const GITHUB_REPO_URL = 'https://github.com/nestlone/linuxdo-emoji'
 
   const CONFIG = {
     marketBaseUrl: GM_getValue('marketBaseUrl', 'https://s.pwsh.us.kg'),
@@ -869,6 +870,7 @@
         name: e.name || 'emoji',
         url: e.url,
         displayUrl: e.displayUrl || e.url,
+        thumbnailUrl: e.thumbnailUrl || e.thumbUrl || e.previewUrl || e.displayUrl || e.url,
         width: e.width || 0,
         height: e.height || 0,
         groupId: groupData.id
@@ -1229,6 +1231,29 @@
         grid-template-columns: repeat(auto-fill, minmax(42px, 1fr));
         gap: 6px;
         content-visibility: auto;
+      }
+
+      /* 虚拟列表仅保留可视区域附近的表情节点，避免大表情包撑满 DOM。 */
+      .mep-virtual-pane {
+        position: relative;
+        display: block;
+        min-height: 1px;
+        content-visibility: visible;
+      }
+
+      .mep-virtual-spacer {
+        width: 100%;
+        pointer-events: none;
+      }
+
+      .mep-virtual-grid {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: repeat(var(--mep-virtual-columns), minmax(42px, 1fr));
       }
 
       .mep-search-pane {
@@ -1992,7 +2017,8 @@
     const item = document.createElement('div')
     item.className = `mep-emoji-item ${isEmojiFavorited(emoji) ? 'is-fav' : ''}`
     item.title = `${emoji.name} (右键/长按可收藏)`
-    const originUrl = emoji.displayUrl || emoji.url
+    // 网格优先使用市场提供的缩略图；悬浮预览与插入仍使用 displayUrl / url。
+    const originUrl = emoji.thumbnailUrl || emoji.displayUrl || emoji.url
     item.dataset.emojiUrl = emoji.url || ''
 
     const img = document.createElement('img')
@@ -2054,36 +2080,95 @@
     return item
   }
 
-  // 分片渐进式渲染（大分组如 400+ 表情依然保持 60 FPS 瞬间响应）
-  function renderEmojisProgressive(container, emojis, chunkSize = 18) {
+  // 虚拟化网格：只创建可视区域及前后两行缓冲的卡片。
+  function renderEmojisProgressive(container, emojis) {
     if (!emojis || emojis.length === 0) return
 
-    // 第一片保持较小，避免首次打开同时创建、解码大量图片。
-    const firstChunk = emojis.slice(0, chunkSize)
-    const firstFragment = document.createDocumentFragment()
-    firstChunk.forEach(e => firstFragment.appendChild(createEmojiItem(e)))
-    container.appendChild(firstFragment)
+    const GAP = 6
+    const MIN_CELL_SIZE = 42
+    const BUFFER_ROWS = 2
+    let scrollRoot = null
+    let scrollListenerBound = false
 
-    if (emojis.length <= chunkSize) return
+    container.classList.add('mep-virtual-pane')
+    container.style.display = 'block'
+    container.innerHTML = '<div class="mep-virtual-spacer"></div><div class="mep-virtual-grid"></div>'
+    const spacer = container.querySelector('.mep-virtual-spacer')
+    const grid = container.querySelector('.mep-virtual-grid')
+    let columns = 1
+    let rowHeight = MIN_CELL_SIZE + GAP
+    let renderedStart = -1
+    let renderedEnd = -1
+    let framePending = false
 
-    // 后续切片使用 requestAnimationFrame 分批追加
-    let currentIndex = chunkSize
-    function mountNextChunk() {
-      if (!container.isConnected) return
-      const nextChunk = emojis.slice(currentIndex, currentIndex + chunkSize)
-      if (nextChunk.length === 0) return
+    function renderVisibleItems() {
+      framePending = false
+      if (!container.isConnected || !scrollRoot) return
 
+      const viewportTop = Math.max(0, scrollRoot.scrollTop - container.offsetTop)
+      const viewportBottom = viewportTop + scrollRoot.clientHeight
+      const firstRow = Math.max(0, Math.floor(viewportTop / rowHeight) - BUFFER_ROWS)
+      const lastRow = Math.min(
+        Math.ceil(emojis.length / columns),
+        Math.ceil(viewportBottom / rowHeight) + BUFFER_ROWS
+      )
+      const start = firstRow * columns
+      const end = Math.min(emojis.length, lastRow * columns)
+      if (start === renderedStart && end === renderedEnd) return
+
+      renderedStart = start
+      renderedEnd = end
+      grid.style.transform = `translateY(${firstRow * rowHeight}px)`
+      grid.innerHTML = ''
       const fragment = document.createDocumentFragment()
-      nextChunk.forEach(e => fragment.appendChild(createEmojiItem(e)))
-      container.appendChild(fragment)
-
-      currentIndex += chunkSize
-      if (currentIndex < emojis.length) {
-        requestAnimationFrame(mountNextChunk)
+      for (let index = start; index < end; index++) {
+        fragment.appendChild(createEmojiItem(emojis[index]))
       }
+      grid.appendChild(fragment)
     }
 
-    requestAnimationFrame(mountNextChunk)
+    function scheduleRender() {
+      if (framePending) return
+      framePending = true
+      requestAnimationFrame(renderVisibleItems)
+    }
+
+    function measureAndRender() {
+      if (!container.isConnected) return
+      if (!scrollRoot) {
+        scrollRoot = container.closest('.mep-content')
+        if (!scrollRoot) {
+          requestAnimationFrame(measureAndRender)
+          return
+        }
+      }
+      if (!scrollListenerBound) {
+        scrollRoot.addEventListener('scroll', scheduleRender, { passive: true })
+        scrollListenerBound = true
+      }
+      const width = container.clientWidth
+      if (!width) {
+        requestAnimationFrame(measureAndRender)
+        return
+      }
+      columns = Math.max(1, Math.floor((width + GAP) / (MIN_CELL_SIZE + GAP)))
+      const cellSize = (width - GAP * (columns - 1)) / columns
+      rowHeight = cellSize + GAP
+      const rowCount = Math.ceil(emojis.length / columns)
+      spacer.style.height = `${Math.max(0, rowCount * rowHeight - GAP)}px`
+      grid.style.setProperty('--mep-virtual-columns', columns)
+      renderedStart = -1
+      renderedEnd = -1
+      scheduleRender()
+    }
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const resizeObserver = new ResizeObserver(measureAndRender)
+      resizeObserver.observe(container)
+    } else {
+      window.addEventListener('resize', measureAndRender, { passive: true })
+    }
+    requestAnimationFrame(measureAndRender)
   }
 
   async function fetchImageData(url) {
@@ -2611,7 +2696,7 @@
         statusText.textContent = group ? `${group.name} (${group.emojis?.length || 0})` : ''
       }
 
-      currentPane.style.display = 'grid'
+      currentPane.style.display = currentPane.classList.contains('mep-virtual-pane') ? 'block' : 'grid'
     }
 
     // 全局关键词搜索过滤（专用 Search Pane，同时搜索收藏夹与选中的分组）
@@ -2635,7 +2720,7 @@
       }
 
       searchPane.innerHTML = ''
-      searchPane.style.display = 'grid'
+      searchPane.style.display = 'block'
 
       const matchedEmojis = []
       const seenUrls = new Set()
