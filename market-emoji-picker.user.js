@@ -44,7 +44,9 @@
     viewMode: GM_getValue('viewMode', 'auto'),
     selectedGroupIds: GM_getValue('selectedGroupIds', []),
     uploadToDiscourse: GM_getValue('uploadToDiscourse', false),
-    activeGroupId: GM_getValue('lastActiveGroupId', 'favorites')
+    activeGroupId: GM_getValue('lastActiveGroupId', 'favorites'),
+    imageCacheMaxItems: Math.max(1, parseInt(GM_getValue('imageCacheMaxItems', 500), 10) || 500),
+    imageCacheMaxBytes: Math.max(1, parseInt(GM_getValue('imageCacheMaxMB', 100), 10) || 100) * 1024 * 1024
   }
 
   // 状态变量
@@ -132,6 +134,8 @@
   // ============== IndexedDB 二进制离线图片缓存 ==============
   const DB_NAME = 'MarketEmojiCacheDB_v3'
   const DB_STORE = 'emoji_blobs'
+  const IMAGE_CACHE_CLEANUP_INTERVAL = 7 * 24 * 60 * 60 * 1000
+  const IMAGE_CACHE_LAST_CLEANUP_KEY = 'emoji_blob_last_cleanup'
   let dbPromise = null
 
   function getDB() {
@@ -160,10 +164,63 @@
   }
 
   const memoryBlobUrlMap = new Map()
+  const pendingEmojiUsageMap = new Map()
+
+  function getTransactionResult(tx) {
+    return new Promise(resolve => {
+      tx.oncomplete = () => resolve(true)
+      tx.onerror = () => resolve(false)
+      tx.onabort = () => resolve(false)
+    })
+  }
+
+  // 读取缓存也算一次访问，用于容量不足时优先保留近期使用过的图片。
+  function touchCachedImage(url) {
+    getDB().then(db => {
+      if (!db || !url) return
+      try {
+        const tx = db.transaction(DB_STORE, 'readwrite')
+        const store = tx.objectStore(DB_STORE)
+        const req = store.get(url)
+        req.onsuccess = () => {
+          const record = req.result
+          if (record) {
+            record.lastAccessed = Date.now()
+            store.put(record)
+          }
+        }
+      } catch {}
+    })
+  }
+
+  // 只有实际插入到编辑器的表情才增加使用次数；预热下载的图片保持 0 次。
+  function recordEmojiUsage(url) {
+    getDB().then(db => {
+      if (!db || !url) return
+      try {
+        const tx = db.transaction(DB_STORE, 'readwrite')
+        const store = tx.objectStore(DB_STORE)
+        const req = store.get(url)
+        req.onsuccess = () => {
+          const record = req.result
+          if (record) {
+            record.useCount = (Number(record.useCount) || 0) + 1
+            record.lastAccessed = Date.now()
+            record.usageTracked = true
+            store.put(record)
+          } else {
+            // 图片可能仍在下载，待写入缓存时再合并这次实际使用记录。
+            pendingEmojiUsageMap.set(url, (pendingEmojiUsageMap.get(url) || 0) + 1)
+          }
+        }
+      } catch {}
+    })
+  }
 
   async function getLocalCachedBlobUrl(url) {
     if (!url) return ''
     if (memoryBlobUrlMap.has(url)) {
+      touchCachedImage(url)
       return memoryBlobUrlMap.get(url)
     }
 
@@ -177,6 +234,7 @@
           const req = store.get(url)
           req.onsuccess = () => {
             if (req.result && req.result.blob) {
+              touchCachedImage(url)
               const blobUrl = URL.createObjectURL(req.result.blob)
               memoryBlobUrlMap.set(url, blobUrl)
               resolve(blobUrl)
@@ -201,10 +259,94 @@
       if (!db) return
       const tx = db.transaction(DB_STORE, 'readwrite')
       const store = tx.objectStore(DB_STORE)
-      store.put({ url, blob, timestamp: Date.now() })
+      const now = Date.now()
+      const existingRequest = store.get(url)
+      existingRequest.onsuccess = () => {
+        const existing = existingRequest.result || {}
+        const pendingUsage = pendingEmojiUsageMap.get(url) || 0
+        pendingEmojiUsageMap.delete(url)
+        store.put({
+          url,
+          blob,
+          size: blob.size || 0,
+          timestamp: existing.timestamp || now,
+          createdAt: existing.createdAt || now,
+          lastAccessed: now,
+          useCount: (Number(existing.useCount) || 0) + pendingUsage,
+          usageTracked: true
+        })
+      }
+      await getTransactionResult(tx)
+      scheduleImageCacheLimitCheck()
     } catch (e) {
       // 忽略存储超限错误
     }
+  }
+
+  async function trimImageCacheToLimits() {
+    try {
+      const db = await getDB()
+      if (!db) return
+      const tx = db.transaction(DB_STORE, 'readwrite')
+      const store = tx.objectStore(DB_STORE)
+      const request = store.getAll()
+      request.onsuccess = () => {
+        const records = (request.result || []).filter(record => record && record.blob)
+        let totalBytes = records.reduce((total, record) => total + (Number(record.size) || record.blob.size || 0), 0)
+        let totalItems = records.length
+        if (totalItems <= CONFIG.imageCacheMaxItems && totalBytes <= CONFIG.imageCacheMaxBytes) return
+
+        // 先删使用次数最少的；次数相同时删最久未访问的。
+        records
+          .sort((a, b) => {
+            const usageDiff = (Number(a.useCount) || 0) - (Number(b.useCount) || 0)
+            if (usageDiff !== 0) return usageDiff
+            return (Number(a.lastAccessed) || Number(a.timestamp) || 0) - (Number(b.lastAccessed) || Number(b.timestamp) || 0)
+          })
+          .forEach(record => {
+            if (totalItems <= CONFIG.imageCacheMaxItems && totalBytes <= CONFIG.imageCacheMaxBytes) return
+            store.delete(record.url)
+            memoryBlobUrlMap.delete(record.url)
+            totalItems -= 1
+            totalBytes -= Number(record.size) || record.blob.size || 0
+          })
+      }
+      await getTransactionResult(tx)
+    } catch {}
+  }
+
+  let imageCacheLimitCheckTimer = null
+  function scheduleImageCacheLimitCheck() {
+    if (imageCacheLimitCheckTimer) return
+    imageCacheLimitCheckTimer = setTimeout(() => {
+      imageCacheLimitCheckTimer = null
+      trimImageCacheToLimits()
+    }, 0)
+  }
+
+  async function cleanupUnusedImageCacheIfDue() {
+    const now = Date.now()
+    const lastCleanup = Number(localStorage.getItem(IMAGE_CACHE_LAST_CLEANUP_KEY)) || 0
+    if (now - lastCleanup < IMAGE_CACHE_CLEANUP_INTERVAL) return
+
+    try {
+      const db = await getDB()
+      if (!db) return
+      const tx = db.transaction(DB_STORE, 'readwrite')
+      const store = tx.objectStore(DB_STORE)
+      const request = store.getAll()
+      request.onsuccess = () => {
+        ;(request.result || []).forEach(record => {
+          // 旧版缓存没有使用记录，不能据此误删；只清理开始追踪后仍未使用的图片。
+          if (record && record.usageTracked === true && Number(record.useCount) <= 0) {
+            store.delete(record.url)
+            memoryBlobUrlMap.delete(record.url)
+          }
+        })
+      }
+      const completed = await getTransactionResult(tx)
+      if (completed) localStorage.setItem(IMAGE_CACHE_LAST_CLEANUP_KEY, now.toString())
+    } catch {}
   }
 
   // 内存预加载缓存池与 IndexedDB 自动缓存
@@ -384,6 +526,30 @@
     CONFIG.enableHoverPreview = newVal
     alert('悬浮大图预览已' + (newVal ? '开启' : '关闭'))
   })
+  GM_registerMenuCommand('💾 设置离线图片缓存上限', () => {
+    const itemInput = prompt('最多缓存多少张图片（默认 500）:', CONFIG.imageCacheMaxItems)
+    if (itemInput === null) return
+    const maxItems = parseInt(itemInput, 10)
+    if (!Number.isInteger(maxItems) || maxItems < 1) {
+      alert('请输入大于 0 的整数')
+      return
+    }
+
+    const mbInput = prompt('缓存最多占用多少 MB（默认 100）:', Math.round(CONFIG.imageCacheMaxBytes / 1024 / 1024))
+    if (mbInput === null) return
+    const maxMB = parseInt(mbInput, 10)
+    if (!Number.isInteger(maxMB) || maxMB < 1) {
+      alert('请输入大于 0 的整数')
+      return
+    }
+
+    CONFIG.imageCacheMaxItems = maxItems
+    CONFIG.imageCacheMaxBytes = maxMB * 1024 * 1024
+    GM_setValue('imageCacheMaxItems', maxItems)
+    GM_setValue('imageCacheMaxMB', maxMB)
+    trimImageCacheToLimits()
+    alert(`离线图片缓存上限已设为 ${maxItems} 张 / ${maxMB} MB`)
+  })
   GM_registerMenuCommand('🗑️ 清除所有本地缓存与离线图片', () => {
     clearAllCache()
     alert('缓存与离线图片已清空，正在重新加载数据')
@@ -399,7 +565,9 @@
     localStorage.removeItem('emoji_market_cache_timestamp')
     localStorage.removeItem('emoji_groups_cache')
     localStorage.removeItem('emoji_groups_cache_timestamp')
+    localStorage.removeItem(IMAGE_CACHE_LAST_CLEANUP_KEY)
     memoryBlobUrlMap.clear()
+    pendingEmojiUsageMap.clear()
     preloadingUrls.clear()
     try {
       const db = await getDB()
@@ -2011,6 +2179,8 @@
         document.execCommand('insertText', false, insertText)
       }
     }
+
+    recordEmojiUsage(emoji.displayUrl || emoji.url)
   }
 
   // ============== 高性能选择器 (Picker) ==============
@@ -2805,6 +2975,7 @@
   // ============== 初始化流程 ==============
   async function init() {
     injectStyles()
+    cleanupUnusedImageCacheIfDue().then(() => trimImageCacheToLimits())
     loadMarketMetadata().catch(() => {})
     loadSelectedGroups().catch(() => {})
 
