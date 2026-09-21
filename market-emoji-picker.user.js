@@ -7,8 +7,8 @@
 // @match        https://linux.do/*
 // @match        https://*.linux.do/*
 // @icon         https://cdn3.ldstatic.com/optimized/3X/9/d/9dd49731091ce8656e94433a26a3ef76f9c0f8d9_2_32x32.png
-// @updateURL    https://raw.githubusercontent.com/shidehai/linuxdo-emoji/main/market-emoji-picker.user.js
-// @downloadURL  https://raw.githubusercontent.com/shidehai/linuxdo-emoji/main/market-emoji-picker.user.js
+// @updateURL    https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js
+// @downloadURL  https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -32,7 +32,7 @@
 
   // ============== 常量与配置 ==============
   const CURRENT_VERSION = '3.4.2'
-  const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/shidehai/linuxdo-emoji/main/market-emoji-picker.user.js'
+  const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js'
   const GITHUB_REPO_URL = 'https://github.com/shidehai/linuxdo-emoji'
 
   const CONFIG = {
@@ -164,7 +164,33 @@
   }
 
   const memoryBlobUrlMap = new Map()
+  const memoryBlobMimeMap = new Map()
   const pendingEmojiUsageMap = new Map()
+
+  function inferImageMimeType(url, responseHeaders = '') {
+    const headerMatch = String(responseHeaders).match(/content-type:\s*([^;\r\n]+)/i)
+    if (headerMatch) return headerMatch[1].trim().toLowerCase()
+    const path = String(url).split(/[?#]/)[0].toLowerCase()
+    if (path.endsWith('.avif')) return 'image/avif'
+    if (path.endsWith('.webp')) return 'image/webp'
+    if (path.endsWith('.gif')) return 'image/gif'
+    if (path.endsWith('.png')) return 'image/png'
+    if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg'
+    if (path.endsWith('.svg')) return 'image/svg+xml'
+    return ''
+  }
+
+  function normalizeImageBlob(blob, url, responseHeaders = '') {
+    if (!blob) return null
+    const inferredType = inferImageMimeType(url, responseHeaders)
+    const type = blob.type && blob.type.startsWith('image/') ? blob.type : inferredType || blob.type
+    return type && blob.type !== type ? new Blob([blob], { type }) : blob
+  }
+
+  function isCompatibleCachedBlob(url, blob) {
+    const expectedType = inferImageMimeType(url)
+    return !expectedType || blob.type === expectedType
+  }
 
   function getTransactionResult(tx) {
     return new Promise(resolve => {
@@ -220,8 +246,13 @@
   async function getLocalCachedBlobUrl(url) {
     if (!url) return ''
     if (memoryBlobUrlMap.has(url)) {
-      touchCachedImage(url)
-      return memoryBlobUrlMap.get(url)
+      if (!isCompatibleCachedBlob(url, { type: memoryBlobMimeMap.get(url) || '' })) {
+        memoryBlobUrlMap.delete(url)
+        memoryBlobMimeMap.delete(url)
+      } else {
+        touchCachedImage(url)
+        return memoryBlobUrlMap.get(url)
+      }
     }
 
     try {
@@ -233,10 +264,11 @@
           const store = tx.objectStore(DB_STORE)
           const req = store.get(url)
           req.onsuccess = () => {
-            if (req.result && req.result.blob) {
+            if (req.result && req.result.blob && isCompatibleCachedBlob(url, req.result.blob)) {
               touchCachedImage(url)
               const blobUrl = URL.createObjectURL(req.result.blob)
               memoryBlobUrlMap.set(url, blobUrl)
+              memoryBlobMimeMap.set(url, req.result.blob.type || '')
               resolve(blobUrl)
             } else {
               resolve('')
@@ -307,6 +339,7 @@
             if (totalItems <= CONFIG.imageCacheMaxItems && totalBytes <= CONFIG.imageCacheMaxBytes) return
             store.delete(record.url)
             memoryBlobUrlMap.delete(record.url)
+            memoryBlobMimeMap.delete(record.url)
             totalItems -= 1
             totalBytes -= Number(record.size) || record.blob.size || 0
           })
@@ -341,6 +374,7 @@
           if (record && record.usageTracked === true && Number(record.useCount) <= 0) {
             store.delete(record.url)
             memoryBlobUrlMap.delete(record.url)
+            memoryBlobMimeMap.delete(record.url)
           }
         })
       }
@@ -349,66 +383,93 @@
     } catch {}
   }
 
-  // 内存预加载缓存池与 IndexedDB 自动缓存
+  // 内存预加载缓存池与 IndexedDB 自动缓存。
+  // 所有网络图片共用一个限流队列，避免弹窗渲染、预热和缓存写入相互抢占。
   const preloadingUrls = new Set()
+  const IMAGE_FETCH_CONCURRENCY = 6
+  const imageFetchQueue = []
+  const imageFetchPromises = new Map()
+  let activeImageFetches = 0
+
+  function runImageFetchQueue() {
+    while (activeImageFetches < IMAGE_FETCH_CONCURRENCY && imageFetchQueue.length > 0) {
+      const task = imageFetchQueue.shift()
+      activeImageFetches += 1
+      fetchImageData(task.url)
+        .then(({ data }) => task.resolve(data))
+        .catch(task.reject)
+        .finally(() => {
+          activeImageFetches -= 1
+          imageFetchPromises.delete(task.url)
+          runImageFetchQueue()
+        })
+    }
+  }
+
+  function fetchImageWithLimit(url, priority = 'low') {
+    if (imageFetchPromises.has(url)) return imageFetchPromises.get(url)
+    const promise = new Promise((resolve, reject) => {
+      const task = { url, resolve, reject }
+      if (priority === 'high') imageFetchQueue.unshift(task)
+      else imageFetchQueue.push(task)
+      runImageFetchQueue()
+    })
+    imageFetchPromises.set(url, promise)
+    return promise
+  }
+
+  function rememberBlobUrl(url, blob) {
+    const existing = memoryBlobUrlMap.get(url)
+    if (existing) return existing
+    const blobUrl = URL.createObjectURL(blob)
+    memoryBlobUrlMap.set(url, blobUrl)
+    memoryBlobMimeMap.set(url, blob.type || '')
+    return blobUrl
+  }
+
+  async function getCachedOrFetchImageUrl(url, priority = 'low') {
+    const localUrl = await getLocalCachedBlobUrl(url)
+    if (localUrl) return localUrl
+
+    const blob = await fetchImageWithLimit(url, priority)
+    if (!blob || blob.size <= 0) throw new Error('图片数据为空')
+    const blobUrl = rememberBlobUrl(url, blob)
+    // 显示直接复用本次下载的 Blob；缓存写入放到后台，不阻塞首屏绘制。
+    saveImageBlobToLocal(url, blob)
+    return blobUrl
+  }
+
   async function preloadAndCacheImage(url, priority = 'low') {
     if (!url || preloadingUrls.has(url)) return
     preloadingUrls.add(url)
-
-    // 检查本地已缓存
-    const localUrl = await getLocalCachedBlobUrl(url)
-    if (localUrl) return
-
-    // 后台静默抓取并缓存 Blob
     try {
-      const { data: blob } = await fetchImageData(url)
-      if (blob && blob.size > 0) {
-        await saveImageBlobToLocal(url, blob)
-        const blobUrl = URL.createObjectURL(blob)
-        memoryBlobUrlMap.set(url, blobUrl)
-      }
+      await getCachedOrFetchImageUrl(url, priority)
     } catch {
       // 网络预热失败平滑忽略
     }
   }
 
-  // 后台并行预热表情与 Tab 图标
+  // 仅在弹窗已打开且浏览器空闲时预热，避免与首屏图片争抢资源。
   function warmupEmojiCache() {
-    const urlsToWarmup = []
-    // 1. 收藏夹表情高优先级预热
-    favoriteEmojis.slice(0, 40).forEach(e => {
-      const u = e.displayUrl || e.url
-      if (u) urlsToWarmup.push(u)
-    })
-
-    // 2. 选中的前 2 个分组表情及全部 Tab 图标
-    if (selectedEmojiGroups && selectedEmojiGroups.length > 0) {
+    const scheduleWarmup = () => {
+      if (!currentPicker) return
+      const urlsToWarmup = []
+      favoriteEmojis.slice(0, 20).forEach(e => {
+        const u = e.displayUrl || e.url
+        if (u) urlsToWarmup.push(u)
+      })
       selectedEmojiGroups.slice(0, 2).forEach(g => {
         if (g.icon) urlsToWarmup.push(g.icon)
-        ;(g.emojis || []).slice(0, 40).forEach(e => {
+        ;(g.emojis || []).slice(0, 20).forEach(e => {
           const u = e.displayUrl || e.url
           if (u) urlsToWarmup.push(u)
         })
       })
+      urlsToWarmup.forEach(u => preloadAndCacheImage(u, 'low'))
     }
-
-    // 并行预热前排表情
-    urlsToWarmup.forEach(u => preloadAndCacheImage(u, 'high'))
-
-    // 空闲时段预热其余表情包
     if (typeof requestIdleCallback !== 'undefined') {
-      requestIdleCallback(() => {
-        const restUrls = []
-        selectedEmojiGroups.slice(2).forEach(g => {
-          if (g.icon) restUrls.push(g.icon)
-          ;(g.emojis || []).slice(0, 30).forEach(e => {
-            const u = e.displayUrl || e.url
-            if (u) restUrls.push(u)
-          })
-        })
-        restUrls.forEach(u => preloadAndCacheImage(u, 'low'))
-      })
-    }
+      requestIdleCallback(scheduleWarmup, { timeout: 2500 })
+    } else setTimeout(scheduleWarmup, 1200)
   }
 
   // ============== 收藏夹核心管理 ==============
@@ -567,6 +628,7 @@
     localStorage.removeItem('emoji_groups_cache_timestamp')
     localStorage.removeItem(IMAGE_CACHE_LAST_CLEANUP_KEY)
     memoryBlobUrlMap.clear()
+    memoryBlobMimeMap.clear()
     pendingEmojiUsageMap.clear()
     preloadingUrls.clear()
     try {
@@ -1209,7 +1271,6 @@
         border-radius: 4px;
         pointer-events: none;
         opacity: 0;
-        transition: opacity 0.15s ease;
       }
 
       .mep-emoji-img.loaded {
@@ -1939,34 +2000,21 @@
     img.alt = emoji.name
     img.decoding = 'async'
 
-    // 优先检查内存或本地 IndexedDB 离线缓存
-    const memoryUrl = memoryBlobUrlMap.get(originUrl)
-    if (memoryUrl) {
-      img.src = memoryUrl
-      img.classList.add('loaded')
-    } else {
-      // 异步读取本地 IndexedDB，若无则直接使用原 URL
-      getLocalCachedBlobUrl(originUrl).then(localUrl => {
-        if (localUrl) {
-          img.src = localUrl
-          img.classList.add('loaded')
-        } else {
-          img.src = originUrl
-          if (img.complete) {
-            img.classList.add('loaded')
-          } else {
-            img.onload = () => {
-              img.classList.add('loaded')
-              // 自动后台离线保存
-              preloadAndCacheImage(originUrl, 'low')
-            }
-            img.onerror = () => {
-              img.style.display = 'none'
-            }
-          }
-        }
-      })
+    img.onload = () => img.classList.add('loaded')
+    img.onerror = () => {
+      img.style.display = 'none'
     }
+
+    // 缓存命中直接复用 Blob；未命中则通过限流队列下载一次，并用同一份 Blob 显示和持久化。
+    getCachedOrFetchImageUrl(originUrl, 'high')
+      .then(imageUrl => {
+        if (!item.isConnected) return
+        img.src = imageUrl
+        if (img.complete) img.classList.add('loaded')
+      })
+      .catch(() => {
+        if (item.isConnected) img.style.display = 'none'
+      })
 
     const starBadge = document.createElement('span')
     starBadge.className = 'mep-star-badge'
@@ -2007,10 +2055,10 @@
   }
 
   // 分片渐进式渲染（大分组如 400+ 表情依然保持 60 FPS 瞬间响应）
-  function renderEmojisProgressive(container, emojis, chunkSize = 36) {
+  function renderEmojisProgressive(container, emojis, chunkSize = 18) {
     if (!emojis || emojis.length === 0) return
 
-    // 第一片（前 36 个）立即同步挂载呈现
+    // 第一片保持较小，避免首次打开同时创建、解码大量图片。
     const firstChunk = emojis.slice(0, chunkSize)
     const firstFragment = document.createDocumentFragment()
     firstChunk.forEach(e => firstFragment.appendChild(createEmojiItem(e)))
@@ -2042,7 +2090,7 @@
     try {
       const response = await fetch(url, { mode: 'cors' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const blob = await response.blob()
+      const blob = normalizeImageBlob(await response.blob(), url, response.headers.get('content-type') || '')
       return { data: blob, type: blob.type }
     } catch {
       return new Promise((resolve, reject) => {
@@ -2055,8 +2103,12 @@
           url,
           responseType: 'blob',
           onload: resp => {
-            const blob = resp.response
-            resolve({ data: blob, type: blob.type || 'image/png' })
+            const blob = normalizeImageBlob(resp.response, url, resp.responseHeaders || '')
+            if (!blob) {
+              reject(new Error('图片数据为空'))
+              return
+            }
+            resolve({ data: blob, type: blob.type || inferImageMimeType(url) || 'image/png' })
           },
           onerror: reject
         })
@@ -2493,7 +2545,7 @@
           </div>
         `
       } else {
-        renderEmojisProgressive(favPane, favoriteEmojis, 40)
+        renderEmojisProgressive(favPane, favoriteEmojis, 18)
       }
 
       if (activeGroupId === 'favorites') {
@@ -2550,7 +2602,7 @@
             currentPane.innerHTML =
               '<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--mep-text-muted);font-size:12px;">该分组暂无表情</div>'
           } else {
-            renderEmojisProgressive(currentPane, group.emojis, 36)
+            renderEmojisProgressive(currentPane, group.emojis, 18)
           }
 
           contentEl.appendChild(currentPane)
@@ -2614,7 +2666,7 @@
         return
       }
 
-      renderEmojisProgressive(searchPane, matchedEmojis.slice(0, 150), 36)
+      renderEmojisProgressive(searchPane, matchedEmojis.slice(0, 150), 18)
     }
 
     searchInput.addEventListener('input', () => {
@@ -2635,6 +2687,7 @@
     currentPicker = picker
 
     positionPicker(picker, anchorEl)
+    warmupEmojiCache()
 
     // 桌面端点击外部关闭
     if (!useMobile) {
