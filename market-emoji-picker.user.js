@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Market Emoji Picker for Linux.do (Performance & UI Pro)
 // @namespace    https://linux.do/
-// @version      0.0.1
+// @version      0.0.2
 // @description  从云端市场加载表情包并允许用户组合分组，注入高性能精美表情选择器到 Linux.do 论坛（版本直显、GitHub一键在线更新、IndexedDB二进制离线缓存、并行高并发加载、分片渐进渲染、表情收藏、零闪烁、现代UI）
 // @author       stevessr (Optimized & Fixed)
 // @match        https://linux.do/*
@@ -32,7 +32,7 @@
   window[INSTANCE_FLAG] = true
 
   // ============== 常量与配置 ==============
-  const CURRENT_VERSION = '0.0.1'
+  const CURRENT_VERSION = '0.0.2'
   const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/nestlone/linuxdo-emoji/main/market-emoji-picker.user.js'
   const GITHUB_REPO_URL = 'https://github.com/nestlone/linuxdo-emoji'
 
@@ -47,7 +47,8 @@
     uploadToDiscourse: GM_getValue('uploadToDiscourse', false),
     activeGroupId: GM_getValue('lastActiveGroupId', 'favorites'),
     imageCacheMaxItems: Math.max(1, parseInt(GM_getValue('imageCacheMaxItems', 500), 10) || 500),
-    imageCacheMaxBytes: Math.max(1, parseInt(GM_getValue('imageCacheMaxMB', 100), 10) || 100) * 1024 * 1024
+    imageCacheMaxBytes: Math.max(1, parseInt(GM_getValue('imageCacheMaxMB', 100), 10) || 100) * 1024 * 1024,
+    lowPerformanceMode: GM_getValue('lowPerformanceMode', 'auto')
   }
 
   // 状态变量
@@ -387,13 +388,12 @@
   // 内存预加载缓存池与 IndexedDB 自动缓存。
   // 所有网络图片共用一个限流队列，避免弹窗渲染、预热和缓存写入相互抢占。
   const preloadingUrls = new Set()
-  const IMAGE_FETCH_CONCURRENCY = 6
   const imageFetchQueue = []
   const imageFetchPromises = new Map()
   let activeImageFetches = 0
 
   function runImageFetchQueue() {
-    while (activeImageFetches < IMAGE_FETCH_CONCURRENCY && imageFetchQueue.length > 0) {
+    while (activeImageFetches < getImageFetchConcurrency() && imageFetchQueue.length > 0) {
       const task = imageFetchQueue.shift()
       activeImageFetches += 1
       fetchImageData(task.url)
@@ -452,6 +452,7 @@
 
   // 仅在弹窗已打开且浏览器空闲时预热，避免与首屏图片争抢资源。
   function warmupEmojiCache() {
+    if (shouldUseLowPerformanceMode()) return
     const scheduleWarmup = () => {
       if (!currentPicker) return
       const urlsToWarmup = []
@@ -539,6 +540,18 @@
     return isMobile() || window.innerWidth < 640
   }
 
+  function shouldUseLowPerformanceMode() {
+    if (CONFIG.lowPerformanceMode === 'on') return true
+    if (CONFIG.lowPerformanceMode === 'off') return false
+    const cpuCores = Number(navigator.hardwareConcurrency) || 0
+    const memoryGB = Number(navigator.deviceMemory) || 0
+    return (cpuCores > 0 && cpuCores <= 4) || (memoryGB > 0 && memoryGB <= 4)
+  }
+
+  function getImageFetchConcurrency() {
+    return shouldUseLowPerformanceMode() ? 2 : 6
+  }
+
   // ============== 油猴菜单注册 ==============
   GM_registerMenuCommand('🚀 检查 GitHub 最新版本', () => checkForUpdates(true))
   GM_registerMenuCommand('⭐ 管理/清空我的收藏', () => {
@@ -587,6 +600,19 @@
     GM_setValue('enableHoverPreview', newVal)
     CONFIG.enableHoverPreview = newVal
     alert('悬浮大图预览已' + (newVal ? '开启' : '关闭'))
+  })
+  GM_registerMenuCommand('🐢 设置低性能模式', () => {
+    const labels = { auto: '自动检测', on: '始终开启', off: '始终关闭' }
+    const input = prompt('输入 auto（自动检测）、on（始终开启）或 off（始终关闭）:', CONFIG.lowPerformanceMode)
+    if (input === null) return
+    const mode = input.trim().toLowerCase()
+    if (!Object.prototype.hasOwnProperty.call(labels, mode)) {
+      alert('请输入 auto、on 或 off')
+      return
+    }
+    CONFIG.lowPerformanceMode = mode
+    GM_setValue('lowPerformanceMode', mode)
+    alert(`低性能模式已设为：${labels[mode]}。重新打开表情选择器后生效。`)
   })
   GM_registerMenuCommand('💾 设置离线图片缓存上限', () => {
     const itemInput = prompt('最多缓存多少张图片（默认 500）:', CONFIG.imageCacheMaxItems)
@@ -1254,6 +1280,41 @@
         display: grid;
         gap: 6px;
         grid-template-columns: repeat(var(--mep-virtual-columns), minmax(42px, 1fr));
+      }
+
+      .mep-paged-pane {
+        display: block;
+      }
+
+      .mep-paged-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(42px, 1fr));
+        gap: 6px;
+      }
+
+      .mep-pagination {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 10px 0 2px;
+        color: var(--mep-text-muted);
+        font-size: 12px;
+      }
+
+      .mep-pagination button {
+        border: 1px solid var(--mep-border);
+        background: var(--mep-surface);
+        color: var(--mep-text);
+        border-radius: 6px;
+        min-width: 28px;
+        height: 24px;
+        cursor: pointer;
+      }
+
+      .mep-pagination button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
       }
 
       .mep-search-pane {
@@ -2012,6 +2073,27 @@
     }
   }
 
+  function isPotentiallyAnimatedImage(url) {
+    return /\.(?:gif|webp|avif)(?:[?#]|$)/i.test(String(url || ''))
+  }
+
+  function createStaticImagePreview(img) {
+    try {
+      if (!img.naturalWidth || !img.naturalHeight) return ''
+      const maxSize = 96
+      const scale = Math.min(1, maxSize / Math.max(img.naturalWidth, img.naturalHeight))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(img.naturalWidth * scale))
+      canvas.height = Math.max(1, Math.round(img.naturalHeight * scale))
+      const context = canvas.getContext('2d', { alpha: true })
+      if (!context) return ''
+      context.drawImage(img, 0, 0, canvas.width, canvas.height)
+      return canvas.toDataURL('image/webp', 0.78)
+    } catch {
+      return ''
+    }
+  }
+
   // ============== 表情卡片创建与分片渐进加载 ==============
   function createEmojiItem(emoji) {
     const item = document.createElement('div')
@@ -2026,7 +2108,20 @@
     img.alt = emoji.name
     img.decoding = 'async'
 
-    img.onload = () => img.classList.add('loaded')
+    const useStaticPreview = shouldUseLowPerformanceMode() && isPotentiallyAnimatedImage(originUrl)
+    const revealImage = () => {
+      if (useStaticPreview && !img.dataset.staticPreview) {
+        img.dataset.staticPreview = 'true'
+        const previewUrl = createStaticImagePreview(img)
+        if (previewUrl) {
+          img.src = previewUrl
+          return
+        }
+      }
+      img.classList.add('loaded')
+    }
+
+    img.onload = revealImage
     img.onerror = () => {
       img.style.display = 'none'
     }
@@ -2036,7 +2131,7 @@
       .then(imageUrl => {
         if (!item.isConnected) return
         img.src = imageUrl
-        if (img.complete) img.classList.add('loaded')
+        if (img.complete) revealImage()
       })
       .catch(() => {
         if (item.isConnected) img.style.display = 'none'
@@ -2080,9 +2175,53 @@
     return item
   }
 
+  function renderEmojisPaged(container, emojis) {
+    const PAGE_SIZE = 12
+    const pageCount = Math.ceil(emojis.length / PAGE_SIZE)
+    let page = 0
+    container.classList.remove('mep-virtual-pane')
+    container.classList.add('mep-paged-pane')
+    container.style.display = 'block'
+    container.innerHTML = '<div class="mep-paged-grid"></div><div class="mep-pagination"><button class="mep-page-prev" title="上一页">‹</button><span></span><button class="mep-page-next" title="下一页">›</button></div>'
+    const grid = container.querySelector('.mep-paged-grid')
+    const pagination = container.querySelector('.mep-pagination')
+    const previousButton = container.querySelector('.mep-page-prev')
+    const nextButton = container.querySelector('.mep-page-next')
+    const pageLabel = pagination.querySelector('span')
+
+    function renderPage() {
+      const start = page * PAGE_SIZE
+      grid.innerHTML = ''
+      const fragment = document.createDocumentFragment()
+      emojis.slice(start, start + PAGE_SIZE).forEach(emoji => fragment.appendChild(createEmojiItem(emoji)))
+      grid.appendChild(fragment)
+      pageLabel.textContent = `${page + 1} / ${pageCount}`
+      previousButton.disabled = page === 0
+      nextButton.disabled = page >= pageCount - 1
+      const scrollRoot = container.closest('.mep-content')
+      if (scrollRoot) scrollRoot.scrollTop = 0
+    }
+
+    previousButton.onclick = () => {
+      if (page <= 0) return
+      page -= 1
+      renderPage()
+    }
+    nextButton.onclick = () => {
+      if (page >= pageCount - 1) return
+      page += 1
+      renderPage()
+    }
+    renderPage()
+  }
+
   // 虚拟化网格：只创建可视区域及前后两行缓冲的卡片。
   function renderEmojisProgressive(container, emojis) {
     if (!emojis || emojis.length === 0) return
+    if (shouldUseLowPerformanceMode()) {
+      renderEmojisPaged(container, emojis)
+      return
+    }
 
     const GAP = 6
     const MIN_CELL_SIZE = 42
@@ -2696,7 +2835,7 @@
         statusText.textContent = group ? `${group.name} (${group.emojis?.length || 0})` : ''
       }
 
-      currentPane.style.display = currentPane.classList.contains('mep-virtual-pane') ? 'block' : 'grid'
+      currentPane.style.display = currentPane.classList.contains('mep-virtual-pane') || currentPane.classList.contains('mep-paged-pane') ? 'block' : 'grid'
     }
 
     // 全局关键词搜索过滤（专用 Search Pane，同时搜索收藏夹与选中的分组）
